@@ -1,0 +1,68 @@
+bconfig
+{
+	"vgmap":
+	[
+		{
+			"name": "rootvg",					# Volume group name
+			"uuid": "T3YVve-q1c4-sjWn-3TeX-oVs9-0x02-cnzqFJ",	# Volume group UUID
+			"pesize": 4096						# Physical extent size in KiB
+		}
+	],
+	"pvmap":
+	[
+		{
+			"path": "/dev/vda3",					# PV path, as reported by `pvdisplay`
+			"uuid": "T3YVve-q1c4-sjWn-3TeX-oVs9-0x02-cnzqFJ",	# PV uuid
+			"vg": "rootvg"						# Volume group name that PV belongs to
+		}
+	],
+	"lvmap":
+	[
+		{
+			"path": "/dev/rootvg/usr_lv",				# LV path, as reported by `lvdisplay`
+			"mount": "/usr",					# LV mount point
+			"uuid": "0f1bL8-sknJ-IeoZ-gXCu-Ao2C-Z1te-ptSIAw",	# LV uuid
+			"vg": "rootvg"						# Volume group name that LV belongs to
+		},
+		{
+			"path": "/dev/rootvg/swap_lv",				# LV path
+			"mount": "swap",					# LV mount point (or 'swap' for swap system)
+			"uuid": "0f1bL8-sknJ-IeoZ-gXCu-Ao2C-Z1te-ptSIAw",	# LV uuid
+			"vg": "rootvg"						# Volume group name that LV belongs to
+		}
+	],
+	"swapmap":
+	[
+		{
+			"path": "/dev/vda2"					# Physical device path
+		}
+	],
+	"imagemap":
+	[
+		{
+			"path": "/dev/rootvg/usr_lv",				# LV path for this image
+			"imagefile": "image/rootvg-usr_lv.sqfs.gz",		# Path to image file in backup directory
+			"device": "",						# Physical device, or blank for logical volumes
+			"format": "squashfs",					# Image format ('squashfs' or 'tar')
+			"fstype": "ext3",					# Filesystem type (ext2, ext3, ext4, xfs)
+			"fsextra": {}						# Extra parameters, dependent on fs type
+		},
+		{
+			"path": "boot",						# Hard-coded 'boot' for boot system
+			"imagefile": "image/boot.sqfs.gz",			# Path to image file in backup directory
+			"device": "/dev/vda1",					# Physical device
+			"format": "squashfs",					# Image format ('squashfs' or 'tar')
+			"fstype": "ext3",					# Filesystem type (ext2, ext3, ext4, xfs)
+			"fsextra": {}						# Extra parameters, dependent on fs type
+		}
+	],
+	"partmap":
+	[
+		{
+			"device": "/dev/vda",					# Physical device path
+			"deffile": "partition/vda.sfd",				# Path to sfdisk definition dump in backup directory
+			"bootstring": "grub"					# Bootloader string, either 'grub' or ''
+		}
+	]
+}
+

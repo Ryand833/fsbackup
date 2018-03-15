@@ -1,0 +1,747 @@
+#!/usr/bin/env python
+
+import os
+import re
+import subprocess
+import sys
+import time
+import logging
+import optparse
+from optparse import OptionParser
+import json
+import fsutils
+
+################################################
+# Check python version
+################################################
+
+if sys.version_info < (2,6,0):
+        sys.stderr.write("You need python 2.6 or later to run fsbackup\n")
+        sys.exit(1)
+
+################################################
+# Helper routine definitions
+################################################
+
+def which(program):
+	def is_exe(fpath):
+		return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+	fpath, fname = os.path.split(program)
+	if fpath:
+		if is_exe(program):
+			return program
+	else:
+		for path in os.environ['PATH'].split(os.pathsep):
+			path = path.strip('"')
+			exe_file = os.path.join(path, program)
+			if is_exe(exe_file):
+				return exe_file
+	return None
+
+def get_path_abs(in_path):
+	dir_path = os.path.dirname(in_path)
+	out_path = in_path
+	if os.path.islink(out_path):
+		out_path = os.readlink(out_path)
+
+	if not os.path.isabs(out_path):
+		out_path = os.path.join(dir_path, out_path)
+		out_path = os.path.abspath(out_path)
+
+	return out_path
+
+def resolve_uuid(uuid):
+	uuid_path = '/dev/disk/by-uuid/{0}'.format(uuid)
+	out_path = get_path_abs(uuid_path)
+	return out_path
+
+def find_bin(program):
+	global binloc
+	binloc[program] = which(program)
+	return binloc[program]
+
+def exec_cmd(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+	logger.debug('Executing: {0}'.format(cmd))
+	p = subprocess.Popen(cmd, shell=shell, stdout=stdout, stderr=stderr)
+	out, err = p.communicate()
+	rcode = p.returncode
+
+	return (rcode, out, err)
+
+class FSError(Exception):
+	def __init__(self, message):
+		self.message = message
+	def __str__(self):
+		return repr(self.message)
+
+class CommandError(Exception):
+	def __init__(self, message, log):
+		self.message = message
+		self.log = log
+	def __str__(self):
+		return repr(self.message)
+
+################################################
+# Intialization vars
+################################################
+
+binloc = {}
+found_boot_volume = False
+physical_devices = []
+bconfig = {}
+
+################################################
+# Command line parsing
+################################################
+
+parser = OptionParser(prog='fsbackup', version='%prog 0.2.2', description="Creates a full online linux system backup for bare-metal recovery")
+parser.add_option('-?', help=optparse.SUPPRESS_HELP, action='store_true', default=False, dest='show_help')
+parser.add_option('-o', help="Output destination path", metavar="<output path>", dest='output')
+parser.add_option('-p', help="Size of LV to make snapshot (default 5)", default=5, type='int', metavar="<percent>", dest='snapsize')
+parser.add_option('-m', help="Snapshot minimum extents (default 25)", default=25, type='int', metavar="<# extents>", dest='snapminextents')
+parser.add_option('-M', help="Snapshot minimum extents (default 128)", default=128, type='int', metavar="<# extents>", dest='snapmaxextents')
+parser.add_option('-G', help="Volume groups to backup (defaults to all if not specified)", action='append', metavar="<vg name>", dest='volgroup')
+parser.add_option('-V', help="Logical volumes to backup (defaults to all if not specified)", action='append', metavar="<lv name>", dest='logvol')
+parser.add_option('-X', help="Volume groups to exclude", action='append', metavar="<vg name>", dest='volgroup_exclude')
+parser.add_option('-x', help="Logical volumes to exclude", action='append', metavar="<lv name>", dest='logvol_exclude')
+parser.add_option('-L', help="Log detail level (1 to 5) (default 4)", default=4, type='choice', metavar="<level>", choices=['1', '2', '3', '4', '5'], dest='loglevel')
+parser.add_option('-l', help="Log destination (can be 'stdout', 'syslog', 'none', or path to a file) (default stdout)", default='stdout', metavar="<dest>", dest='logdest')
+parser.add_option('-s', help="Use `mksquashfs` for backup (default)", action='store_true', default=False, dest='use_mksquashfs')
+parser.add_option('-t', help="Use `tar` for backup", action='store_true', default=False, dest='use_tar')
+(args, _) = parser.parse_args()
+
+args.loglevel = int(args.loglevel)
+
+if args.show_help:
+	parser.print_help()
+	sys.exit(1)
+
+if not args.output:
+	parser.error("Output destination path (-o) not given")
+
+if args.use_tar and args.use_mksquashfs:
+	parser.error("options -s and -t are mutually exclusive")
+
+if not args.use_tar and not args.use_mksquashfs:
+	args.use_mksquashfs = True
+
+################################################
+# Setup logging
+################################################
+
+logger = logging.getLogger('fsbackup')
+log_handler = None
+log_formatter = None
+if args.logdest == 'stdout':
+	log_handler = logging.StreamHandler(sys.stdout)
+	log_formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+elif args.logdest == 'syslog':
+	log_handler = logging.SysLogHandler(address='/dev/log')
+elif args.logdest == 'none':
+	log_handler = logging.NullHandler()
+else:
+	log_handler = logging.FileHandler(args.logdest)
+	log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+
+if log_formatter:
+	log_handler.setFormatter(log_formatter)
+logger.addHandler(log_handler)
+
+logger.setLevel(logging.INFO)
+if args.loglevel == 1:
+	logger.setLevel(logging.CRITICAL)
+elif args.loglevel == 2:
+	logger.setLevel(logging.ERROR)
+elif args.loglevel == 3:
+	logger.setLevel(logging.WARNING)
+elif args.loglevel == 4:
+	logger.setLevel(logging.INFO)
+elif args.loglevel == 5:
+	logger.setLevel(logging.DEBUG)
+
+logger.debug("Logging started")
+
+################################################
+# Main routine definitions
+################################################
+
+def backup_init():
+	try:
+		logger.info("Beginning backup initialization")
+		if os.getuid() != 0:
+			raise FSError("fsbackup must be run as root")
+		if find_bin('mksquashfs') == None:
+			raise FSError("mksquashfs is required")
+		if find_bin('tar') == None:
+			raise FSError("tar is required")
+		if find_bin('sfdisk') == None:
+			raise FSError("sfdisk is required")
+		if find_bin('dd') == None:
+			raise FSError("dd is required")
+		if find_bin('blkid') == None:
+			raise FSError("blkid is required")
+
+		if args.output[-1] != '/':
+			args.output += '/'
+		if not os.path.isdir(args.output):
+			raise FSError("Output directory '{0}' does not exist or is not a directory".format(args.output))
+		if os.listdir(args.output):
+			raise FSError("Output directory '{0}' is not empty. Choose a destination directory that is empty.".format(args.output))
+
+		if args.use_mksquashfs:
+			# Make sure mksquashfs is at least version 4.1 for ACLs and xattr
+			rcode, out, err = exec_cmd('mksquashfs -version')
+			m = re.search('mksquashfs version ([0-9]+)\.([0-9]+)', out)
+			if m:
+				ver_major = int(m.group(1))
+				ver_minor = int(m.group(2))
+				if ver_major < 4 or ver_minor < 1:
+					raise FSError("mksquashfs version 4.1 or higher required, detected {0}.{1}".format(ver_major, ver_minor))
+			else:
+				raise FSError("Unable to determine mksquashfs version")
+
+		if not os.path.isdir('{0}image'.format(args.output)):
+			os.makedirs('{0}image'.format(args.output))
+		if not os.path.isdir('{0}partition'.format(args.output)):
+			os.makedirs('{0}partition'.format(args.output))
+		if not os.path.isdir('{0}lvm'.format(args.output)):
+			os.makedirs('{0}lvm'.format(args.output))
+		bconfig['vgmap'] = []
+		bconfig['lvmap'] = []
+		bconfig['pvmap'] = []
+		bconfig['imagemap'] = []
+		bconfig['swapmap'] = []
+		bconfig['partmap'] = []
+		bconfigfile = open('{0}fsbackup.config'.format(args.output), 'w')
+		bconfigfile.close()
+	
+	except FSError as e:
+		logger.critical("Error in backup init: {0}".format(e.message))
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backup init, traceback follows:")
+		logger.exception(e)
+		raise
+	
+	return True
+
+#--------------------------------------------
+
+def backup_volume_groups():
+	try:
+		logger.info("Backing up volume group metadata")
+		rcode, out, err = exec_cmd('vgdisplay -c')
+		if rcode:
+			raise CommandError("`vgdisplay` command returned code {0}".format(rcode), err)
+		out = out.strip().split('\n')
+		for i in out:
+			vgparams = i.strip().split(':')
+			vgname = vgparams[0]
+			vguuid = vgparams[16]
+			pesize = int(vgparams[12])
+			freepe = int(vgparams[15])
+			if args.volgroup and not vgname in args.volgroup:
+				continue
+			if args.volgroup_exclude and vgname in args.volgroup_exclude:
+				continue
+			if freepe < args.snapmaxextents:
+				raise FSError("Volume group '{0}' only has {1} free PEs, requires {2}".format(vgname, freepe, args.snapmaxextents))
+			if os.path.exists('/dev/{0}/snap_lv'.format(vgname)):
+				raise FSError("Snapshot volume already exists for VG '{0}'. Previous backup failed?".format(vgname))
+
+			bconfig['vgmap'].append({'name': vgname, 'uuid' : vguuid, 'pesize': pesize})
+			rcode, qout, qerr = exec_cmd('vgcfgbackup -f {0}lvm/{1} {2}'.format(args.output, vgname, vgname))
+			if rcode:
+				raise CommandError("`vgcfgbackup` command returned code {0}".format(rcode), qerr)
+
+	except FSError as e:
+		logger.critical("Error in backing up volume groups: {0}".format(e.message))
+		raise
+	except CommandError as e:
+		logger.critical("Command error in backing up volume groups: {0}".format(e.message))
+		logger.critical(e.log.strip())
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up volume groups, traceback follows:")
+		logger.exception(e)
+		raise
+
+	return True
+
+#--------------------------------------------
+
+def backup_logical_volumes():
+	global found_boot_volume
+	try:
+		fstab = None
+		logger.info("Backing up logical volumes")
+		rcode, out, err = exec_cmd('df -P')
+		if rcode:
+			raise CommandError("`df` command returned code {0}".format(rcode), err)
+
+		out = out.strip().split('\n')
+		dfdict = {}
+		for i in out:
+			dfparams = re.split(' +', i, 5)
+			if dfparams[5].lower().find('mounted on') != -1:
+				continue
+			dfpath = dfparams[0]
+			dfmount = dfparams[5]
+			if not os.path.exists(dfpath):
+				continue
+
+			dfrealpath = get_path_abs(dfpath)
+			dfdict[dfrealpath] = dfmount
+
+		rcode, out, err = exec_cmd('lvdisplay -c')
+		if rcode:
+			raise CommandError("`lvdisplay` command returned code {0}".format(rcode), err)
+		out = out.strip().split('\n')
+		for i in out:
+			lvparams = i.strip().split(':')
+			lvpath = lvparams[0]
+			vgname = lvparams[1]
+			lvextents = lvparams[7]
+			lvrealpath = get_path_abs(lvpath)
+
+			if args.volgroup and not vgname in args.volgroup:
+				continue
+			if args.volgroup_exclude and vgname in args.volgroup_exclude:
+				continue
+			if args.logvol and not lvpath in args.logvol:
+				continue
+			if args.logvol_exclude and lvpath in args.logvol_exclude:
+				continue
+
+			fstype = None
+			fsextra = {}
+
+			# Find lv uuid
+			rcode, qout, qerr = exec_cmd('lvdisplay {0}'.format(lvpath))
+			if rcode:
+				raise CommandError("`lvdisplay` command returned code {0}".format(rcode), qerr)
+			m = re.search('LV UUID\\s+([^\\r\\n]+)', qout)
+			if m:
+				lvuuid = m.group(1)
+			else:
+				raise FSError("Unable to determine LV UUID for LV '{0}'".format(lvpath))
+	
+			rcode, qout, qerr = exec_cmd('file -sL {0}'.format(lvpath))
+			if rcode:
+				raise CommandError("`file` command returned code {0}".format(rcode), qerr)
+
+			if re.search('swap file', qout):
+				# Write record to lvmap with a mount of "swap" so that we can rebuild it on restore
+				bconfig['lvmap'].append({'path': lvpath, 'mount': 'swap', 'uuid': lvuuid, 'vg': vgname})
+				continue
+
+			if re.search('ext2', qout):
+				fstype = 'ext2'
+				fsextra = fsutils.ext2_get_info(lvpath)
+			elif re.search('ext3', qout):
+				fstype = 'ext3'
+				fsextra = fsutils.ext2_get_info(lvpath)
+			elif re.search('ext4', qout):
+				fstype = 'ext4'
+				fsextra = fsutils.ext2_get_info(lvpath)
+			elif re.search('XFS', qout):
+				fstype = 'xfs'
+				fsextra = fsutils.xfs_get_info(lvpath)
+
+			if not fstype:
+				raise FSError("Logical volume '{0}' has invalid filesystem type: {1}".format(lvpath, qout))
+
+			lvmountpath = ''
+			if lvrealpath in dfdict:
+				lvmountpath = dfdict[lvrealpath]
+				if lvmountpath == '/boot':
+					found_boot_volume = True
+			else:
+				fstab = open('/etc/fstab', 'r')
+				for line in fstab:
+					fstab_params = re.split('\s+', line)
+					if len(fstab_params) == 0:
+						continue
+					if fstab_params[0][0] == '#':
+						continue
+					fstab_devpath = fstab_params[0]
+					fstab_mount = fstab_params[1]
+					m = re.search('^UUID=(.*)', fstab_devpath)
+					if m:
+						fstab_devpath = resolve_uuid(m.group(1))
+					if not os.path.exists(fstab_devpath):
+						continue
+					if not fstab_mount[0] == '/':
+						continue
+
+					lvmountpath = fstab_mount
+					break
+
+				fstab.close()
+
+			logger.info("Backing up LV '{0}'".format(lvpath))
+
+			bconfig['lvmap'].append({'path': lvpath, 'mount': lvmountpath, 'uuid': lvuuid, 'vg': vgname})
+
+			snapextents = int(lvextents) * args.snapsize / 100
+			snapextents = min(snapextents, args.snapmaxextents)
+			snapextents = max(snapextents, args.snapminextents)
+			m = re.search('\/([^\/]+)$', lvpath)
+			if m:
+				lvname = m.group(1)
+				imgtype = ''
+				lvimgname = ''
+				if args.use_mksquashfs:
+					imgtype = 'squashfs'
+					lvimgname = 'image/{0}-{1}.sqfs.gz'.format(vgname, lvname)
+				elif args.use_tar:
+					imgtype = 'tar'
+					lvimgname = 'image/{0}-{1}.tar.gz'.format(vgname, lvname)
+				bconfig['imagemap'].append({'path': lvpath, 'imagefile': lvimgname, 'device': '', 'format': imgtype, 'fstype': fstype, 'fsextra': fsextra})
+				rcode, qout, qerr = exec_cmd('lvcreate -s {0} -n snap_lv -l {1}'.format(lvpath, snapextents))
+				if rcode:
+					raise CommandError("`lvcreate` snapshot command returned code {0}".format(rcode), qerr)
+				if not os.path.isdir('/mnt/fsbackup_mount'):
+					os.makedirs('/mnt/fsbackup_mount')
+				mount_extra_options = '-o ro'
+				if fstype == 'xfs':
+					mount_extra_options = '-o ro,nouuid'
+				rcode, qout, qerr = exec_cmd('mount {0} /dev/{1}/snap_lv /mnt/fsbackup_mount'.format(mount_extra_options, vgname))
+				if rcode:
+					_, _, _ = exec_cmd('lvremove -f /dev/{0}/snap_lv'.format(vgname))
+					raise CommandError("`mount` command returned code {0}".format(rcode), qerr)
+				if args.use_mksquashfs:
+					rcode, qout, qerr = exec_cmd('mksquashfs /mnt/fsbackup_mount {0}{1}'.format(args.output, lvimgname))
+					if rcode:
+						_, _, _ = exec_cmd('umount /mnt/fsbackup_mount')
+						_, _, _ = exec_cmd('lvremove -f /dev/{0}/snap_lv'.format(vgname))
+						raise CommandError("`mksquashfs` command returned code {0}".format(rcode), qerr)
+				elif args.use_tar:
+					tar_options = ''
+					if os.path.isfile('/etc/yum.conf'):
+						tar_options += ' --acls --xattrs --selinux'
+					rcode, qout, qerr = exec_cmd('tar cpzf {0}{1}{2} -C /mnt/fsbackup_mount/ ./'.format(args.output, lvimgname, tar_options))
+					if rcode:
+						_, _, _ = exec_cmd('umount /mnt/fsbackup_mount')
+						_, _, _ = exec_cmd('lvremove -f /dev/{0}/snap_lv'.format(vgname))
+						raise CommandError("`tar` command returned code {0}".format(rcode), qerr)
+				rcode, qout, qerr = exec_cmd('umount /mnt/fsbackup_mount')
+				if rcode:
+					_, _, _ = exec_cmd('lvremove -f /dev/{0}/snap_lv'.format(vgname))
+					raise CommandError("`umount` command returned code {0}".format(rcode), qerr)
+				rcode, qout, qerr = exec_cmd('lvremove -f /dev/{0}/snap_lv'.format(vgname))
+				if rcode:
+					raise CommandError("`lvremove` command returned code {0}".format(rcode), qerr)
+
+				logger.info("Verifying image '{0}'".format(lvimgname))
+				# Image verification
+				devnull = open(os.devnull, 'wb')
+				if args.use_mksquashfs:
+					rcode, _, _ = exec_cmd('unsquashfs -l {0}{1}'.format(args.output, lvimgname), stdout=devnull, stderr=devnull)
+					if rcode:
+						devnull.close()
+						raise FSError("Verification failed for image '{0}' (return code {1})".format(lvimgname, rcode))
+				elif args.use_tar:
+					rcode, _, _ = exec_cmd('tar tzvf {0}{1}'.format(args.output, lvimgname), stdout=devnull, stderr=devnull)
+					if rcode:
+						devnull.close()
+						raise FSError("Verification failed for image '{0}' (return code {1})".format(lvimgname, rcode))
+				devnull.close()
+
+			else:
+				raise FSError("Unable to determine LV name")
+
+	except FSError as e:
+		logger.critical("Error in backing up logical volumes: {0}".format(e.message))
+		if fstab:
+			fstab.close()
+		raise
+	except CommandError as e:
+		logger.critical("Command error in backing up logical volumes: {0}".format(e.message))
+		logger.critical(e.log.strip())
+		if fstab:
+			fstab.close()
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up logical volumes, traceback follows:")
+		logger.exception(e)
+		if fstab:
+			fstab.close()
+		raise
+
+	return True
+		
+#--------------------------------------------
+
+def backup_physical_volumes():
+	global physical_devices
+	try:
+		logger.info("Backing up physical volume metadata")
+		rcode, out, err = exec_cmd('pvdisplay -c')
+		if rcode:
+			raise CommandError("`pvdisplay` command returned code {0}".format(rcode), err)
+		out = out.strip().split("\n")
+		for i in out:
+			pvparams = i.strip().split(':')
+			pvpath = pvparams[0]
+			m = re.search('(.*)([0-9]+)$', pvpath)
+			if m:
+				pvdisk = m.group(1)
+			else:
+				raise FSError("Unable to parse device path from '{0}'".format(pvpath))
+			vgname = pvparams[1]
+			pvuuid = pvparams[11]
+			if args.volgroup and not vgname in args.volgroup:
+				continue
+			if args.volgroup_exclude and vgname in args.volgroup_exclude:
+				continue
+			if not pvdisk in physical_devices:
+				physical_devices.append(pvdisk)
+			bconfig['pvmap'].append({'path': pvpath, 'uuid': pvuuid, 'vg': vgname})
+
+	except FSError as e:
+		logger.critical("Error in backing up physical volumes: {0}".format(e.message))
+		raise
+	except CommandError as e:
+		logger.critical("Command error in backing up physical volumes: {0}".format(e.message))
+		logger.critical(e.log.strip())
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up physical volumes, traceback follows:")
+		logger.exception(e)
+		raise
+		
+	return True
+
+#--------------------------------------------
+
+def backup_boot_partition():
+	try:
+		logger.info("Backing up boot partition")
+		rcode, out, err = exec_cmd('df -P')
+		if rcode:
+			raise CommandError("`df` command returned code {0}".format(rcode), err)
+		out = out.strip().split('\n')
+		boot_device = ''
+		fstype = None
+		fsextra = {}
+		for i in out:
+			dfparams = re.split(' +', i, 5)
+			if dfparams[5].lower().find('mounted on') != -1:
+				continue
+			dfpath = dfparams[0]
+			dfmount = dfparams[5]
+			if not os.path.exists(dfpath):
+				continue
+			if not dfmount == '/boot':
+				continue
+
+			dfrealpath = get_path_abs(dfpath)
+			boot_device = dfrealpath
+			break
+
+		if boot_device == '':
+			# Didn't find boot partition as its own device, so we check here to see if it's included in the root filesystem
+			dev_boot = os.stat('/boot/').st_dev
+			dev_root = os.stat('/').st_dev
+			if os.major(dev_boot) == os.major(dev_root) and os.minor(dev_boot) == os.minor(dev_root):
+				return True
+			else:
+				raise FSError("Unable to find boot partition")
+
+		rcode, out, err = exec_cmd('file -sL {0}'.format(boot_device))
+		if rcode:
+			raise CommandError("`file` command returned code {0}".format(rcode), err)
+
+		if re.search('ext2', out):
+			fstype = 'ext2'
+			fsextra = fsutils.ext2_get_info(boot_device)
+		elif re.search('ext3', out):
+			fstype = 'ext3'
+			fsextra = fsutils.ext2_get_info(boot_device)
+		elif re.search('ext4', out):
+			fstype = 'ext4'
+			fsextra = fsutils.ext2_get_info(boot_device)
+		elif re.search('XFS', out):
+			fstype = 'xfs'
+			fsextra = fsutils.xfs_get_info(boot_device)
+
+		if not fstype:
+			raise FSError("Boot partition '{0}' has invalid filesystem type: {1}".format(boot_device, out))
+
+		imgtype = ''
+		imgname = ''
+		if args.use_mksquashfs:
+			imgtype = 'squashfs'
+			imgname = 'image/boot.sqfs.gz'
+		elif args.use_tar:
+			imgtype = 'tar'
+			imgname = 'image/boot.tar.gz'
+		bconfig['imagemap'].append({'path': 'boot', 'imagefile': imgname, 'device': boot_device, 'format': imgtype, 'fstype': fstype, 'fsextra': fsextra})
+		if args.use_mksquashfs:
+			rcode, out, err = exec_cmd('mksquashfs /boot {0}{1}'.format(args.output, imgname))
+			if rcode:
+				raise CommandError("`mksquashfs` command returned code {0}".format(rcode), err)
+		elif args.use_tar:
+			tar_options = ''
+			if os.path.isfile('/etc/yum.conf'):
+				tar_options += ' --acls --xattrs --selinux'
+			rcode, qout, qerr = exec_cmd('tar cpzf {0}{1}{2} -C /boot/ ./'.format(args.output, imgname, tar_options))
+			if rcode:
+				raise CommandError("`tar` command returned code {0}".format(rcode), qerr)
+
+		# TODO: add image verification here
+
+	except FSError as e:
+		logger.critical("Error in backing up boot partition: {0}".format(e.message))
+		raise
+	except CommandError as e:
+		logger.critical("Command error in backing up boot partition: {0}".format(e.message))
+		logger.critical(e.log.strip())
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up boot partition, traceback follows:")
+		logger.exception(e)
+		raise
+
+	return True
+
+#--------------------------------------------
+
+def backup_swap_config():
+	try:
+		fstab = None
+		logger.info("Backing up swap system metadata")
+		fstab = open('/etc/fstab', 'r')
+		for line in fstab:
+			fstab_params = re.split('\s+', line)
+			if len(fstab_params) == 0:
+				continue
+			if len(fstab_params[0]) == 0:
+				continue
+			if fstab_params[0][0] == '#':
+				continue
+			if fstab_params[2] == 'swap':
+				swap_dev_path = fstab_params[0]
+				swap_uuid = ''
+				m = re.search('^UUID=(.*)', swap_dev_path)
+				if m:
+					swap_dev_path = resolve_uuid(m.group(1))
+					swap_uuid = m.group(1)
+				swap_dev_path = get_path_abs(swap_dev_path)
+				if swap_dev_path.startswith('/dev/dm') or swap_dev_path.startswith('/dev/mapper'):
+					# Logical swap partitions are stored in lvmap so we don't need to capture it here
+					continue
+				# if the swap path doesn't start with /dev/ that most likely means it's a swap file
+				# instead of a swap filesystem and we don't need to back that up
+				if not swap_dev_path.startswith('/dev/'):
+					continue
+				bconfig['swapmap'].append({'path': swap_dev_path, 'uuid': swap_uuid})
+
+		fstab.close()
+	
+	except FSError as e:
+		logger.critical("Error in backing up swap config: {0}".format(e.message))
+		if fstab:
+			fstab.close()
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up swap config, traceback follows:")
+		logger.exception(e)
+		if fstab:
+			fstab.close()
+		raise
+
+	return True
+
+#--------------------------------------------
+
+def backup_partition_tables():
+	try:
+		logger.info("Backing up partition table metadata")
+		for dev in physical_devices:
+			if dev.startswith('/dev/md'):
+				continue
+			devbase = os.path.basename(dev)
+			f = open('{0}partition/{1}.sfd'.format(args.output, devbase), 'a')
+			devnull = open(os.devnull, 'wb')
+
+			# Rather than writing directly to the file, parse output and remove label, label-id, and device headers
+			# Then ensures backwards compatibility with older versions of sfdisk for restoring (2.25 and earlier)
+			rcode, out, _ = exec_cmd('sfdisk -d {0}'.format(dev), stderr=devnull)
+			if rcode:
+				f.close()
+				devnull.close()
+				raise FSError("`sfdisk` command returned code {0}".format(rcode))
+			out = out.strip().split('\n')
+			for i in out:
+				if i.find('label:') != -1:
+					continue
+				if i.find('label-id:') != -1:
+					continue
+				if i.find('device:') != -1:
+					continue
+
+				f.write('{0}\n'.format(i))
+
+			f.close()
+			devnull.close()
+			rcode, out, err = exec_cmd('dd if={0} bs=512 count=1'.format(dev))
+			if rcode:
+				raise CommandError("`dd` command returned code {0}".format(rcode), err)
+			grubstr = ''
+			if out.find('GRUB') >= 0:
+				grubstr = 'grub'
+			bconfig['partmap'].append({'device': dev, 'deffile': 'partition/{0}.sfd'.format(devbase), 'bootstring': grubstr})
+
+	except FSError as e:
+		logger.critical("Error in backing up partition tables: {0}".format(e.message))
+		raise
+	except CommandError as e:
+		logger.critical("Command error in backing up partition tables: {0}".format(e.message))
+		logger.critical(e.log.strip())
+		raise
+	except Exception as e:
+		logger.error("Unhandled exception in backing up partition tables, traceback follows:")
+		logger.exception(e)
+		raise
+
+	return True
+		
+#--------------------------------------------
+
+def backup_finalize():
+	try:
+		logger.info("Finalizing backup")
+		bconfigfile = open('{0}fsbackup.config'.format(args.output), 'a')
+		json.dump(bconfig, bconfigfile, indent=4)
+		bconfigfile.close()
+		
+	except Exception as e:
+		logger.error("Unhandled exception in finalizing backup, traceback follows:")
+		logger.exception(e)
+		raise
+
+	return True
+
+#--------------------------------------------
+
+if __name__ == "__main__":
+	try:
+		backup_init()
+		backup_volume_groups()
+		backup_logical_volumes()
+		backup_physical_volumes()
+		backup_boot_partition()
+		backup_swap_config()
+		backup_partition_tables()
+		backup_finalize()
+
+		logger.info("Backup complete")
+		sys.exit(0)
+
+	except Exception as e:
+		logger.critical("Backup process exiting (1)")
+		sys.exit(1)
+

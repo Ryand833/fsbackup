@@ -1,0 +1,13 @@
+One backup script
+-----------------------
+The backup script does a full copy into a directory
+
+
+Three restore scripts
+-----------------------
+1) Full system restore -- guided command-driven restore script to do a full system restore to bare-metal
+
+2) Curses-based GUI for individual file/dir restore inside the OS
+
+3) Command-line argument script for individual file/dir restore inside the OS
+   May potentially combine this with script #2

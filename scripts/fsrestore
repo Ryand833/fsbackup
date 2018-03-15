@@ -1,0 +1,675 @@
+#!/usr/bin/env python
+
+import os
+import subprocess
+import sys
+import optparse
+from optparse import OptionParser
+import json
+import readline
+import fsutils
+import traceback
+
+################################################
+# Check python version
+################################################
+
+if sys.version_info < (2,6,0):
+	sys.stderr.write("You need python 2.6 or later to run fsrestore\n")
+	sys.exit(1)
+
+
+################################################
+# Helper routine definitions
+################################################
+
+def prompt(prompt, valid, default):
+	tprompt = '{0} '.format(prompt)
+	if default:
+		tprompt += '[{0}] '.format(default)
+	while True:
+		answer = raw_input(tprompt).lower()
+		if answer == '':
+			if default == '':
+				continue
+			answer = default
+		answer = answer[0]
+		if valid.find(answer) == -1:
+			continue
+		return answer
+
+def do_command(cmd, caption):
+	# Possible return values
+	#  1 = command executed successfully
+	#  2 = command skipped
+	#  3 = command execution failed, but continued
+	# -1 = command executed successfully, but aborted
+	# -2 = command not executed, aborted
+	# -3 = command execution failed, and aborted
+	global continuous_mode, devnull
+	retval = 0
+	reexecute = True
+	retry = True
+	org_cmd = cmd
+	while retry:
+		while reexecute:
+			print '-----------------------'
+			print bcolors.YELLOW + caption + bcolors.END
+			print 'Command: {0}{1}{2}'.format(bcolors.GREEN, cmd, bcolors.END)
+			while True:
+				valid_opts = 'ynces'
+				valid_str = 'y/n/c=continuous/e=edit/s=skip'
+				if not cmd == org_cmd:
+					valid_opts = 'yncers'
+					valid_str = 'y/n/c=continuous/e=edit/r=reset/s=skip'
+				if continuous_mode:
+					answer = 'y'
+				else:
+					answer = prompt("Ready to execute command? ({0})".format(valid_str), valid_opts, '')
+	
+				if answer == 'y':
+					reexecute = False
+					break
+				elif answer == 'n':
+					confirm = prompt("Are you sure you want to abort? (y/n)", 'yn', '')
+					if confirm == 'y':
+						retval = -2
+						return retval
+					else:
+						continue
+				elif answer == 's':
+					retval = 2
+					return retval
+				elif answer == 'e':
+					sys.stdout.write(bcolors.YELLOW)
+					readline.set_startup_hook(lambda: readline.insert_text(cmd))
+					cmd = raw_input("Edit Command: ")
+					readline.set_startup_hook()
+					sys.stdout.write(bcolors.END)
+					break
+				elif answer == 'r':
+					cmd = org_cmd
+					break
+				elif answer == 'c':
+					reexecute = False
+					continuous_mode = True
+					break
+				else:
+					continue
+
+		sys.stdout.write("Executing.... ")
+		sys.stdout.flush()
+		p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=devnull)
+		out, err = p.communicate()
+		rcode = p.returncode
+		default_answer = ''
+		if rcode == 0:
+			sys.stdout.write("OK\n")
+			print "Return Value: {0}{1}{2}".format(bcolors.GREEN, rcode, bcolors.END)
+			default_answer = 'c'
+		else:
+			sys.stdout.write("FAILED\n")
+			print "Return Value: {0}{1}{2}".format(bcolors.RED, rcode, bcolors.END)
+			default_answer = 'a'
+		while True:
+			if continuous_mode and rcode == 0:
+				answer = 'c'
+			else:
+				answer = prompt("Action: (c=continue,a=abort,r=retry,o=view stdout,e=view stderr)", 'caroe', default_answer)
+				continuous_mode = False
+
+			if answer == 'c':
+				if rcode == 0:
+					retval = 1
+				else:
+					retval = 3
+				return retval
+			elif answer == 'a':
+				confirm = prompt("Are you sure you want to abort? (y/n)", 'yn', '')
+				if confirm == 'y':
+					if rcode == 0:
+						retval = -1
+					else:
+						retval = -3
+					return retval
+				else:
+					continue
+			elif answer == 'o':
+				print bcolors.BLUE + out.strip() + bcolors.END
+				continue
+			elif answer == 'e':
+				print bcolors.YELLOW + err.strip() + bcolors.END
+				continue
+			elif answer == 'r':
+				retval = 0
+				reexecute = True
+				retry = True
+				break
+			else:
+				continue
+
+def check_bconfig_dict(bconfig):
+	#if not bconfig['vgmap'] or not bconfig['pvmap'] or not bconfig['lvmap'] or not bconfig['swapmap'] or not bconfig['imagemap'] or not bconfig['partmap']:
+	if not all (k in bconfig for k in ('vgmap', 'pvmap', 'lvmap', 'swapmap', 'imagemap', 'partmap')):
+		return False
+
+	return True
+
+def which(program):
+	def is_exe(fpath):
+		return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+	fpath, fname = os.path.split(program)
+	if fpath:
+		if is_exe(program):
+			return program
+	else:
+		for path in os.environ['PATH'].split(os.pathsep):
+			path = path.strip('"')
+			exe_file = os.path.join(path, program)
+			if is_exe(exe_file):
+				return exe_file
+	return None
+
+def find_bin(program):
+	global binloc
+	binloc[program] = which(program)
+	return binloc[program]
+
+def exec_cmd(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+	p = subprocess.Popen(cmd, shell=shell, stdout=stdout, stderr=stderr)
+	out, err = p.communicate()
+	rcode = p.returncode
+
+	return (rcode, out, err)
+
+class FSError(Exception):
+	def __init__(self, message):
+		self.message = message
+	def __str__(self):
+		return repr(self.message)
+
+class CommandAborted(Exception):
+	def __init__(self, cmd, res):
+		self.cmd = cmd
+		self.res = res
+	def __str__(self):
+		return repr(self.res)
+
+################################################
+# Initialization vars
+################################################
+
+binloc = {}
+vgdict = {}
+imagedict = {}
+filesystems = {}
+dmdict = {}
+bconfig = {}
+continuous_mode = False
+devnull = open(os.devnull, 'rb')
+
+class bcolors:
+	MAGENTA = '\033[35m'
+	BLUE = '\033[94m'
+	GREEN = '\033[92m'
+	YELLOW = '\033[93m'
+	RED = '\033[91m'
+	END = '\033[0m'
+
+	def disable(self):
+		self.MAGENTA = ''
+		self.BLUE = ''
+		self.GREEN = ''
+		self.YELLOW = ''
+		self.RED = ''
+		self.END = ''
+
+################################################
+# Command line parsing
+################################################
+
+parser = OptionParser(prog='fsrestore', version='%prog 0.2.2', description="Restores a full system backup to bare-metal system")
+parser.add_option('-?', help=optparse.SUPPRESS_HELP, action='store_true', default=False, dest='show_help')
+parser.add_option('-i', help='Backup directory location', metavar='<input path>', dest='input')
+parser.add_option('-g', help='Restore GRUB MBR', nargs=2, metavar='<path> <device>', dest='grubinst')
+parser.add_option('-c', help='Run in continuous mode', action='store_true', default=False, dest='continuous')
+(args, _) = parser.parse_args()
+
+if args.show_help:
+	parser.print_help()
+	sys.exit(1)
+
+if args.input and args.grubinst:
+	parser.error("options -i and -g are mutually exclusive")
+
+if not args.input and not args.grubinst:
+	parser.error("must specify either -i or -g")
+
+continuous_mode = args.continuous
+
+
+################################################
+# Main routine definitions
+################################################
+
+def restore_init():
+	global binloc, args, bconfig
+	try:
+		if os.getuid() != 0:
+			raise FSError("fsrestore must be run as root")
+		if find_bin('sfdisk') == None:
+			raise FSError("sfdisk is required")
+		if find_bin('unsquashfs') == None:
+			raise FSError("unsquashfs is required")
+		if find_bin('tar') == None:
+			raise FSError("tar is required")
+		if find_bin('dmsetup') == None:
+			raise FSError("dmsetup is required")
+		if find_bin('pvcreate') == None:
+			raise FSError("pvcreate is required")
+		if find_bin('vgcfgrestore') == None:
+			raise FSError("vgcfgrestore is required")
+		if find_bin('vgscan') == None:
+			raise FSError("vgscan is required")
+		if find_bin('lvscan') == None:
+			raise FSError("lvscan is required")
+		if find_bin('vgchange') == None:
+			raise FSError("vgchange is required")
+		if find_bin('tune2fs') == None:
+			raise FSError("tune2fs is required")
+		if find_bin('xfs_admin') == None:
+			raise FSError("xfs_admin is required")
+		if find_bin('mkfs') == None:
+			raise FSError("mkfs is required")
+		if find_bin('mkswap') == None:
+			raise FSError("mkswap is required")
+		if find_bin('mkdir') == None:
+			raise FSError("mkdir is required")
+		if find_bin('mount') == None:
+			raise FSError("mount is required")
+		if find_bin('umount') == None:
+			raise FSError("umount is required")
+
+		if not os.path.isdir('/mnt/fsrestore_mount'):
+			os.makedirs('/mnt/fsrestore_mount')
+		if args.input[-1] != '/':
+			args.input += '/'
+		if not os.path.isdir(args.input):
+			raise FSError("Input directory '{0}' does not exist or is not a directory".format(args.input))
+		if not os.path.isfile('{0}fsbackup.config'.format(args.input)):
+			raise FSError("No backup config file 'fsbackup.config' found in specified directory")
+
+		try:
+			bconfigfile = open('{0}fsbackup.config'.format(args.input), 'r')
+			bconfig = json.load(bconfigfile)
+			bconfigfile.close()
+		except ValueError:
+			raise FSError("Unable to parse backup config file (not valid JSON?)")
+		if not check_bconfig_dict(bconfig):
+			raise FSError("Invalid backup config file '{0}fsbackup.config'".format(args.input))
+		for entry in bconfig['imagemap']:
+			imagedict[entry['path']] = entry
+
+	except Exception as e:
+		raise
+
+	return True
+
+#--------------------------------------------
+
+def restore_partition_tables():
+	for entry in bconfig['partmap']:
+		cmd = '{0} {1} < {2}{3}'.format(binloc['sfdisk'], entry['device'], args.input, entry['deffile'])
+		res = do_command(cmd, "Restore partitions to '{0}'".format(entry['device']))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_physical_volumes():
+	for entry in bconfig['pvmap']:
+		pvpath = entry['path']
+		pvvg = entry['vg']
+		pvuuid = entry['uuid']
+		cmd = '{0} --uuid "{1}" --restorefile {2}lvm/{3} {4}'.format(binloc['pvcreate'], pvuuid, args.input, pvvg, pvpath)
+		res = do_command(cmd, "Re-create physical volume '{0}'".format(pvpath))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_volume_groups():
+	global vgdict
+	for entry in bconfig['vgmap']:
+		vgname = entry['name']
+		vguuid = entry['uuid']
+		vgdict[vgname] = vguuid
+		cmd = '{0} -f {1}lvm/{2} {3}'.format(binloc['vgcfgrestore'], args.input, vgname, vgname)
+		res = do_command(cmd, "Restore LVM config for '{0}'".format(vgname))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	cmd = binloc['vgscan']
+	res = do_command(cmd, "Re-scan volume groups")
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	cmd = binloc['lvscan']
+	res = do_command(cmd, "Re-scan logical volumes")
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	for entry in bconfig['vgmap']:
+		vgname = entry['name']
+		cmd = '{0} -a y {1}'.format(binloc['vgchange'], vgname)
+		res = do_command(cmd, "Activate volume group '{0}'".format(vgname))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_logical_volumes():
+	global filesystems, dmdict
+	rcode, out, err = exec_cmd('{0} info -c --noheadings'.format(binloc['dmsetup']))
+	out = out.strip().split('\n')
+	for i in out:
+		dm_params = i.strip().split(':')
+		dmname = dm_params[0]
+		dmuuid = dm_params[7]
+		dmdict[dmuuid] = dmname
+	for entry in bconfig['lvmap']:
+		lvpath = entry['path']
+		lvmount = entry['mount']
+		lvuuid = entry['uuid']
+		vgname = entry['vg']
+		vguuid = vgdict[vgname]
+		if lvmount == 'swap':
+			continue
+		imagepath = imagedict[lvpath]['imagefile']
+		dmuuid = 'LVM-' + vguuid.replace('-', '') + lvuuid.replace('-', '')
+		dmname = dmdict[dmuuid]
+		dmpath = '/dev/mapper/' + dmname
+		if not lvmount == '':
+			filesystems[lvmount] = dmpath
+		# to restore from squashfs -- do mkfs on block device first, then mount, then unsquashfs, then unmount
+		imgtype = imagedict[lvpath]['format']
+		fstype = imagedict[lvpath]['fstype']
+		fsextra = imagedict[lvpath]['fsextra']
+		max_steps = 5
+		if fstype == 'xfs':
+			cmd = fsutils.xfs_get_mkfs(binloc['mkfs'], dmpath, fsextra)
+		elif fstype in ('ext2', 'ext3', 'ext4'):
+			fsextra['type'] = fstype
+			cmd = fsutils.ext2_get_mkfs(binloc['mkfs'], dmpath, fsextra)
+		res = do_command(cmd, "Restore LV '{0}' Step 1/{1}".format(lvpath, max_steps))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+		if fstype == 'xfs':
+			cmd = fsutils.xfs_get_extra(binloc['xfs_admin'], dmpath, fsextra)
+		elif fstype in ('ext2', 'ext3', 'ext4'):
+			fsextra['type'] = fstype
+			cmd = fsutils.ext2_get_extra(binloc['tune2fs'], dmpath, fsextra)
+		res = do_command(cmd, "Restore LV '{0}' Step 2/{1}".format(lvpath, max_steps))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+		cmd = '{0} {1} /mnt/fsrestore_mount'.format(binloc['mount'], dmpath)
+		res = do_command(cmd, "Restore LV '{0}' Step 3/{1}".format(lvpath, max_steps))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+		if imgtype == 'squashfs':
+			cmd = '{0} -f -d /mnt/fsrestore_mount/ {1}{2}'.format(binloc['unsquashfs'], args.input, imagepath)
+		elif imgtype == 'tar':
+			cmd = '{0} xpzf {1}{2} -C /mnt/fsrestore_mount/ --acls --xattrs --selinux'.format(binloc['tar'], args.input, imagepath)
+		res = do_command(cmd, "Restore LV '{0}' Step 4/{1}".format(lvpath, max_steps))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+		cmd = '{0} /mnt/fsrestore_mount'.format(binloc['umount'])
+		res = do_command(cmd, "Restore LV '{0}' Step 5/{1}".format(lvpath, max_steps))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_boot_partition():
+	imgtype = imagedict['boot']['format']
+	fstype = imagedict['boot']['fstype']
+	fsextra = imagedict['boot']['fsextra']
+	max_steps = 5
+	if fstype == 'xfs':
+		cmd = fsutils.xfs_get_mkfs(binloc['mkfs'], imagedict['boot']['device'], fsextra)
+	elif fstype in ('ext2', 'ext3', 'ext4'):
+		fsextra['type'] = fstype
+		cmd = fsutils.ext2_get_mkfs(binloc['mkfs'], imagedict['boot']['device'], fsextra)
+	res = do_command(cmd, "Restore boot partition - Step 1/{0}".format(max_steps))
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	if fstype == 'xfs':
+		cmd = fsutils.xfs_get_extra(binloc['xfs_admin'], imagedict['boot']['device'], fsextra)
+	elif fstype in ('ext2', 'ext3', 'ext4'):
+		fsextra['type'] = fstype
+		cmd = fsutils.ext2_get_extra(binloc['tune2fs'], imagedict['boot']['device'], fsextra)
+	res = do_command(cmd, "Restore boot partition - Step 2/{0}".format(max_steps))
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	cmd = '{0} {1} /mnt/fsrestore_mount'.format(binloc['mount'], imagedict['boot']['device'])
+	res = do_command(cmd, "Restore boot partition - Step 3/{0}".format(max_steps))
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	if imgtype == 'squashfs':
+		cmd = '{0} -f -d /mnt/fsrestore_mount/ {1}{2}'.format(binloc['unsquashfs'], args.input, imagedict['boot']['imagefile'])
+	elif imgtype == 'tar':
+		cmd = '{0} xpzf {1}{2} -C /mnt/fsrestore_mount/ --acls --xattrs --selinux'.format(binloc['tar'], args.input, imagedict['boot']['imagefile'])
+	res = do_command(cmd, "Restore boot partition - Step 4/{0}".format(max_steps))
+	if res < 0:
+		raise CommandAborted(cmd, res)
+	cmd = '{0} /mnt/fsrestore_mount'.format(binloc['umount'])
+	res = do_command(cmd, "Restore boot partition - Step 5/{0}".format(max_steps))
+	if res < 0:
+		raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_swap_systems():
+	# swapmap will only contain physical devices, not logical volumes -- logical volume swaps are stored in lvmap
+	for entry in bconfig['swapmap']:
+		swapdev = entry['path']
+		swap_uuid = entry['uuid']
+		if not swap_uuid.strip() == '':
+			cmd = '{0} -U "{1}" {2}'.format(binloc['mkswap'], swap_uuid, swapdev)
+		else:
+			cmd = '{0} {1}'.format(binloc['mkswap'], swapdev)
+		res = do_command(cmd, "Re-create swap filesystem '{0}'".format(swapdev))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+	for entry in bconfig['lvmap']:
+		lvmount = entry['mount']
+		lvuuid = entry['uuid']
+		vgname = entry['vg']
+		vguuid = vgdict[vgname]
+		if not lvmount == 'swap':
+			continue
+		dmuuid = 'LVM-' + vguuid.replace('-', '') + lvuuid.replace('-', '')
+		dmname = dmdict[dmuuid]
+		dmpath = '/dev/mapper/' + dmname
+		cmd = '{0} {1}'.format(binloc['mkswap'], dmpath)
+		res = do_command(cmd, "Re-create swap filesystem '{0}'".format(dmpath))
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def restore_grub():
+	global filesystems, continuous_mode
+	## TODO: how to handle software raid here?
+	## For now, if partmap is empty, get out
+	if not bconfig['partmap']:
+		return
+	
+	for entry in bconfig['imagemap']:
+		imagename = entry['path']
+		devpath = entry['device']
+		if imagename == 'boot':
+			filesystems['/boot'] = devpath
+
+	if not '/' in filesystems:
+		raise FSError("Cannot find root filesystem")
+
+	cmd = '{0} /mnt/linux'.format(binloc['mkdir'])
+	res = do_command(cmd, "Make mount point for root filesystem")
+	if res < 0:
+		raise CommandAborted(cmd, res)
+
+	cmd = '{0} {1} /mnt/linux'.format(binloc['mount'], filesystems['/'])
+	res = do_command(cmd, "Mount root filesystem")
+	if res < 0:
+		raise CommandAborted(cmd, res)
+
+	if '/boot' in filesystems:
+		cmd = '{0} {1} /mnt/linux/boot'.format(binloc['mount'], filesystems['/boot'])
+		res = do_command(cmd, "Mount boot filesystem")
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	for fskey in sorted(filesystems.iterkeys()):
+		if fskey == '/' or fskey == '/boot':
+			continue
+		cmd = '{0} {1} /mnt/linux{2}'.format(binloc['mount'], filesystems[fskey], fskey)
+		res = do_command(cmd, "Mount filesystem")
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	for fs in ('/proc', '/dev', '/sys'):
+		cmd = '{0} -o bind {1} /mnt/linux{2}'.format(binloc['mount'], fs, fs)
+		res = do_command(cmd, "Mount filesystem")
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	# Execute chroot process
+	for entry in bconfig['partmap']:
+		devpath = entry['device']
+		devgrub = entry['bootstring']
+		if not devgrub == 'grub':
+			continue
+
+		if continuous_mode:
+			cmd = '{0} -c -g /mnt/linux {1}'.format(sys.argv[0], devpath)
+		else:
+			cmd = '{0} -g /mnt/linux {1}'.format(sys.argv[0], devpath)
+		rcode, out, err = exec_cmd(cmd, stdout=None, stderr=None)
+		if not rcode == 0:
+			raise FSError("Grub installation routine failed: {0}".format(err))
+
+	# Now unmount all filesystems, reverse order
+	for fs in ('/proc', '/dev', '/sys'):
+		cmd = '{0} /mnt/linux{1}'.format(binloc['umount'], fs)
+		res = do_command(cmd, "Unmount filesystem")
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	for fskey in sorted(filesystems.iterkeys(), reverse=True):
+		cmd = '{0} /mnt/linux{1}'.format(binloc['umount'], fskey)
+		res = do_command(cmd, "Unmount filesystem")
+		if res < 0:
+			raise CommandAborted(cmd, res)
+
+	return
+
+#--------------------------------------------
+
+def call_grubinst():
+	if os.getuid() != 0:
+		sys.stderr.write("fsrestore must be run as root")
+		sys.exit(1)
+
+	chroot_path = args.grubinst[0]
+	grub_dev = args.grubinst[1]
+	os.chroot(chroot_path)
+	os.chdir('/')
+
+	grubinst_name = 'grub-install'
+	grubinst_loc = which(grubinst_name)
+	if grubinst_loc == None:
+		grubinst_name = "grub2-install"
+		grubinst_loc = which(grubinst_name)
+		if grubinst_loc == None:
+			sys.stderr.write("Couldn't locate either 'grub-install' or 'grub2-install'\n")
+			sys.exit(1)
+
+	cmd = '{0} --recheck {1}'.format(grubinst_loc, grub_dev)
+	res = do_command(cmd, "Execute {0} to install GRUB to disk MBR".format(grubinst_name))
+	if res < 0:
+		sys.exit(1)
+
+	return
+
+################################################
+# Main restore routine
+################################################
+
+if __name__ == "__main__":
+	if args.grubinst:
+		call_grubinst()
+		sys.exit(0)
+
+	try:
+		##### INITIALIZE
+		sys.stdout.write("############################\n")
+		sys.stdout.write("#      System Restore      #\n")
+		sys.stdout.write("############################\n")
+		restore_init()
+
+		##### PARTITION TABLES
+		sys.stdout.write(bcolors.MAGENTA + "Restoring partitions...\n" + bcolors.END)
+		restore_partition_tables()
+
+		##### PHYSICAL VOLUMES
+		sys.stdout.write(bcolors.MAGENTA + "Restoring physical volumes...\n" + bcolors.END)
+		restore_physical_volumes()
+
+		##### VOLUME GROUPS
+		sys.stdout.write(bcolors.MAGENTA + "Restoring volume groups...\n" + bcolors.END)
+		restore_volume_groups()
+
+		##### LOGICAL VOLUMES
+		sys.stdout.write(bcolors.MAGENTA + "Restoring logical volumes...\n" + bcolors.END)
+		restore_logical_volumes()
+
+		##### BOOT PARTITION
+		sys.stdout.write(bcolors.MAGENTA + "Restoring boot partition...\n" + bcolors.END)
+		restore_boot_partition()
+
+		##### SWAP SYSTEMS
+		sys.stdout.write(bcolors.MAGENTA + "Restoring swap systems...\n" + bcolors.END)
+		restore_swap_systems()
+
+		##### REINSTALL GRUB
+		sys.stdout.write(bcolors.MAGENTA + "Restoring GRUB...\n" + bcolors.END)
+		restore_grub()
+
+	except CommandAborted as e:
+		sys.stdout.write(bcolors.RED + "Command was aborted\nWARNING: RESTORE ABORTED PREMATURELY, SYSTEM WILL NOT BOOT\n" + bcolors.END)
+		sys.exit(1)
+	except FSError as e:
+		sys.stdout.write(bcolors.RED + "Restore error: " + e.message + "\n" + bcolors.END)
+		sys.exit(1)
+	except Exception as e:
+		sys.stdout.write(bcolors.RED + "Unhandled exception: {0}, traceback follows:\n".format(e))
+		traceback.print_exc(file=sys.stdout)
+		sys.stdout.write("\n" + bcolors.END)
+		sys.exit(1)
+
+	devnull.close()
+	sys.stdout.write(bcolors.GREEN + "-----------------------\nRestore completed\n" + bcolors.END)
+	sys.exit(0)
+

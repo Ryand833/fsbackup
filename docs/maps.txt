@@ -1,0 +1,74 @@
+The following maps and layouts are used:
+
+* = Used for restore
+
+NAME: vgmap
+DESC: list of volume groups
+DELIMITER: ":"
+---------------------------
+0	volume group name (e.g. rootvg)
+1	volume group uuid (e.g. T3YVve-q1c4-sjWn-3TeX-oVs9-0x02-cnzqFJ)
+2	pe size in KiB (e.g. 4096)
+
+
+
+
+
+NAME: imagemap
+DESC: list of backup images
+DELIMITER: ":"
+---------------------------
+0	logical volume path, as reported by `lvdisplay` (e.g. /dev/rootvg/usr_lv)
+	or simply 'boot' for the boot partition
+1	path to image, relative to backup directory (e.g. image/boot.sqfs.gz)
+2	path to physical device. blank for logical volumes, only used for boot partition (e.g. /dev/vda1)
+3	image type (squashfs, tar)
+4	filesystem type (ext2, ext3, ext4, xfs)
+5	extra filesystem options (such as uuid for xfs, etc)
+
+
+
+
+
+NAME: lvmap
+DESC: list of LVM logical volumes
+DELIMITER: ":"
+---------------------------
+0	logical volume path, as reported by `lvdisplay` (e.g. /dev/rootvg/usr_lv)
+1	mount path of logical volume (e.g. /usr)
+2	logical volume uuid, as reported by `lvdisplay` (e.g. 0f1bL8-sknJ-IeoZ-gXCu-Ao2C-Z1te-ptSIAw)
+3	volume group name, as reported by `lvdisplay` (e.g. testvg)
+
+
+
+
+
+NAME: pvmap
+DESC: list of LVM physical volumes
+DELIMITER: ":"
+---------------------------
+0 *	physical volume path, as reported by `pvdisplay` (e.g. /dev/sda3)
+1	volume group name, as reported by `pvdisplay` (e.g. rootvg)
+2 *	uuid, as reported by `pvdisplay` (e.g. T3YVve-q1c4-sjWn-3TeX-oVs9-0x02-cnzqFJ)
+
+
+
+
+
+NAME: swapmap
+DESC: list of swap partitions
+DELIMITER: none
+---------------------------
+0 *	physical device path (e.g. /dev/sda2)
+
+
+
+
+
+NAME: partmap
+DESC: list of physical disk partitions
+DELIMITER: ":"
+---------------------------
+0 *	physical device path (e.g. /dev/sda or /dev/vda)
+1 *	path to sfdisk config relative to backup directory (e.g. partition/sda.sfd)
+2	'grub' if disk contains grub MBR, empty otherwise
