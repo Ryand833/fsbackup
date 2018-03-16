@@ -208,6 +208,13 @@ def xfs_get_info(devname):
 def xfs_get_mkfs(cmdname, devname, xfs_info):
 	options = ' -t xfs '
 
+	# UUID
+	# Setting the UUID requires xfs-progs to be at least version 4.3.0+
+	options += ' -m uuid={0} '.format(xfs_info['uuid'])
+
+	# Force
+	options += ' -f '
+
 	# Volume label
 	options += ' -L "{0}" '.format(xfs_info['label'])
 
@@ -221,10 +228,8 @@ def xfs_get_mkfs(cmdname, devname, xfs_info):
 def xfs_get_extra(cmdname, devname, xfs_info):
 	options = ''
 
-	# UUID
-	options = ' -U {0} '.format(xfs_info['uuid'])
-
 	# Assemble command
-	cmd = '{0} {1} {2}'.format(cmdname, options, devname)
+	#cmd = '{0} {1} {2}'.format(cmdname, options, devname)
+	cmd = ''
 	return cmd
 
