@@ -107,6 +107,7 @@ parser.add_option('-X', help="Volume groups to exclude", action='append', metava
 parser.add_option('-x', help="Logical volumes to exclude", action='append', metavar="<lv name>", dest='logvol_exclude')
 parser.add_option('-L', help="Log detail level (1 to 5) (default 4)", default=4, type='choice', metavar="<level>", choices=['1', '2', '3', '4', '5'], dest='loglevel')
 parser.add_option('-l', help="Log destination (can be 'stdout', 'syslog', 'none', or path to a file) (default stdout)", default='stdout', metavar="<dest>", dest='logdest')
+parser.add_option('-d', help="Hide date and time stamps from log", action='store_true', dest='hidedate')
 parser.add_option('-s', help="Use `mksquashfs` for backup (default)", action='store_true', default=False, dest='use_mksquashfs')
 parser.add_option('-t', help="Use `tar` for backup", action='store_true', default=False, dest='use_tar')
 (args, _) = parser.parse_args()
@@ -135,14 +136,16 @@ log_handler = None
 log_formatter = None
 if args.logdest == 'stdout':
 	log_handler = logging.StreamHandler(sys.stdout)
-	log_formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+	if not args.hidedate:
+		log_formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
 elif args.logdest == 'syslog':
 	log_handler = logging.SysLogHandler(address='/dev/log')
 elif args.logdest == 'none':
 	log_handler = logging.NullHandler()
 else:
 	log_handler = logging.FileHandler(args.logdest)
-	log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+	if not args.hidedate:
+		log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 
 if log_formatter:
 	log_handler.setFormatter(log_formatter)
